@@ -20,21 +20,23 @@
    Operation
     power:
       push the button to turn it on
-        battery ok: light continually blinks green (.05s every 5s)
-        battery marginal: light continually blinks red (.05s every 5s)
-        battery too low: light blinks long red (5x: .5s every 1s), then unit shuts off
+        all three lights flash
+        if battery is marginal, the red light flashes every 5 seconds
+        if the battery is too low, all lights flash 5 times and the unit shuts off
       push the button to turn it off
-        light blinks red once (.5s), then shuts off
-      after 8 hours
-        unit turns off automatically
+        all three lights flash once, and the unit shuts off
+      after 1 hour of no activity, the unit turns off automatically
    mode: when the unit turns on, it tries to detect an opposing IR transmitter
     if no IR signal detected, it becomes the IR transmitter
-      yellow status light blinks continually (.05s every 1s)
+      the yellow light blinks every 2 seconds
     if an IR signal is detected: it becomes the IR receiver
-      when the IR signal is interrupted for >.2s
-        blue light turns on until IR signal returns
-        send a Bluetooth message (format TBD)
-
+      the blue light blinks every 2 seocnds
+      when the IR signal is interrupted,
+        the blue light turns on for 2 seconds
+        it sends a Bluetooth "beambreak" message
+        the blue light turns off until IR beam returns
+      if the beam break lasts more than 10 seconds,
+        it send a Bluetooth "beamlost" message and flashes the blue and yellow lights 3 times
 
    The design of the hardware and software for the sensors and the corresponding
    receiver is open-source.  See https://github.com/LenShustek/walksensor.
@@ -62,22 +64,28 @@
   **** Change log ****
 
    31 Oct 2016, V1.0, L. Shustek, First version.
+   16 Nov 2017, V1.1, L. Shustek, various enhancements on the way to production
 
    TODO:
-   - work on better sleep/hibernate mode to reduce current
-   - experiment with lower duty cycle for transmit: can it be as reliable?
-   - change shutdown to: 1 hour after last event
-   - flash the blue light every second when we're a receiver
+   - experiment with a lower duty cycle for transmit; can it be as reliable?
+   - work on better sleep/hibernate mode to reduce current?
+     (Snoozelib doesn't work; try https://github.com/adafruit/Adafruit_SleepyDog)
 
 *****************************************************************************************************/
-#define VERSION "1.0"
+#define VERSION "1.1"
 
-#define DEBUG true
+#define DEBUG false
 #define BLUETOOTH true
 #define USE_INTERRUPT true
 #define STOP_IF_BATTERY_LOW true
 #define USE_SLEEP false
 
+/* power utilization without going into sleep mode:
+  off: about 10 ua, so several years with 2000 mAH AA batteries
+  transmitter: 15 ma average, so 130 hours with 2000 maH AA batteries  
+  receiver: 14 ma average, so 142 hours with 2000 maH AA batteries
+*/
+  
 #include <Arduino.h>
 #include <SPI.h>
 #include "Adafruit_BLE.h"
@@ -92,7 +100,9 @@
 #define IR_XMT_PERIOD 5           //* IR transmit cycle time in milliseconds between bursts
 #define IR_RCV_PERIOD 50          //* IR receive sample period
 #define XLED_ON 50                // transmit status LED on time in milliseconds
-#define XLED_PERIOD 1000          // transmit status LED cycle time in milliseconds
+#define XLED_PERIOD 2000          // transmit status LED cycle time in milliseconds
+#define RLED_ON 50                // receive status LED on time in milliseconds
+#define RLED_PERIOD 2000          // receive status LED cycle time in milliseconds
 #define BLED_ON 50                // battery LED on time in milliseconds
 #define BLED_PERIOD 5000          // battery LED cycle time in millliseconds
 #define BATTERY_CHK_PERIOD 5000   // battery check time in milliseconds
@@ -101,10 +111,14 @@
 #define PULSE_WIDTH_PERCENT 97    //* what percent of an IR pulse we need to see to count it
 #define MISSING_PULSE_THRESHOLD 2 //* how many missing pulses constitute a beam break
 #define CHK_RCV_TIME 500          // how long to wait to see if the other guy is sending, in msec
+#define RCV_RECOVER_TIME 1500     // how long to wait for beam to be recovered after break, in msec
 
 #define IR_FREQ 38000L            // tuned IR receiver frequency
-#define POWERDOWN_HOURS 8         // after how many hours to power down automatically
+#define BEAMLOST_SECONDS 10       // after how many seconds to send "beam lost" message
+#define POWERDOWN_MINUTES 60      // after how many minutes to power down automatically
 #define DEBOUNCE_DELAY 25         // debounce delay in msec
+#define MSG_DUPS 3                // how many duplicate messages to send
+#define MSG_DELAY 50              // how many milliseconds between duplicate messages
 
 #define BATTERY_WEAK 5000         // millivolt level (out of 6000) to warn about low battery 
 #define BATTERY_FAIL 3900         // millivolt level (out of 6000) to treat as battery failure
@@ -134,10 +148,11 @@ Adafruit_BluefruitLE_SPI ble(BLUEFRUIT_SPI_CS, BLUEFRUIT_SPI_IRQ, BLUEFRUIT_SPI_
 
 // global variables
 
-bool receiver = false;    // are we the receiver?
-volatile int falling_pulses = 0;   // how many IR pulses have we received
-int ir_time = 0;          // count milliseconds of IR transmit cycle
-int battery_time = 0;     // count milliseconds of battery check time
+bool receiver = false;            // are we the receiver?
+volatile int falling_pulses = 0;  // how many IR pulses have we received
+int ir_time = 0;                  // count milliseconds of IR transmit cycle
+int battery_time = 0;             // count milliseconds of battery check time
+unsigned long starttime_millis;   // starting time, or time of last activity
 
 struct led_status { // LED state
    int led;
@@ -145,12 +160,14 @@ struct led_status { // LED state
    int period;  // msec
    int cycle_count; }
 led_battery = {LED_GREEN, BLED_ON, BLED_PERIOD, 0 },
+led_receiving = {LED_BLUE, RLED_ON, RLED_PERIOD, 0 },
 led_transmitting = {LED_YELLOW, XLED_ON, XLED_PERIOD, 0 };
 
 #if USE_INTERRUPT
 // In order to compile the interrupt routine, you must comment out line 43 in Adafruit_BluefruitLE_UART.h
 // located in Len\Documents\Arduino\libraries\Adafruit_BluefruitLE_nRF51-master
-// See https://forums.adafruit.com/viewtopic.php?f=24&t=83256&start=15 about this library bug.
+// See https://forums.adafruit.com/viewtopic.php?f=24&t=83256&start=15 about this library bug,
+// and also https://forums.adafruit.com/viewtopic.php?f=57&t=105935
 
 ISR(PCINT0_vect) { // interrupt for falling or rising edge of IR receiver
    // count only those low pulses that are "almost" as wide as what the transmitter sends
@@ -203,46 +220,45 @@ bool chk_ble_connection(void) {
    ble_connected = conn;
    return ble_connected; }
 
+void flashlights(int duration, int times) {
+   for (int i = 0; i < times; ++i) {  // flash lights to show we're alive
+      digitalWrite(LED_YELLOW, HIGH);
+      digitalWrite(LED_BLUE, HIGH);
+      digitalWrite(LED_GREEN, HIGH);
+      //  digitalWrite(LED_RED, HIGH);
+      delay(duration);
+      digitalWrite(LED_YELLOW, LOW);
+      digitalWrite(LED_BLUE, LOW);
+      digitalWrite(LED_GREEN, LOW);
+      digitalWrite(LED_RED, LOW);
+      delay(duration); } }
 
 void setup() {
-
    pinMode(POWERUP_FET, OUTPUT);     // so that we stay alive after the on/off button push is over,
    digitalWrite(POWERUP_FET, HIGH);  // turn on the power MOSFET as quickly as possible
 
    pinMode(POWERDOWN_SW, INPUT_PULLUP);
    pinMode(BATTERY_VOLTAGE, INPUT); // analog input
-
    pinMode(IR_RECEIVE, INPUT_PULLUP);
    pinMode(IR_TRANSMIT, OUTPUT);
-   digitalWrite(IR_TRANSMIT, HIGH); // transmitter disabled
-
+   digitalWrite(IR_TRANSMIT, HIGH); // disable IR transmitter
    pinMode(LED_YELLOW, OUTPUT);
    pinMode(LED_BLUE, OUTPUT);
    pinMode(LED_GREEN, OUTPUT);
    pinMode(LED_RED, OUTPUT);
-
-   for (int i = 0; i < 3; ++i) {  // flash lights to show we're alive
-      digitalWrite(LED_YELLOW, HIGH);
-      digitalWrite(LED_BLUE, HIGH);
-      digitalWrite(LED_GREEN, HIGH);
-      //  digitalWrite(LED_RED, HIGH);
-      delay(100);
-      digitalWrite(LED_YELLOW, LOW);
-      digitalWrite(LED_BLUE, LOW);
-      digitalWrite(LED_GREEN, LOW);
-      digitalWrite(LED_RED, LOW);
-      delay(100); }
+   flashlights(100, 3); // 100 msec flash, 3 times
 
    if (DEBUG) {
       //while (!Serial) ;
       delay(2000);
       Serial.begin(115200);
-      Serial.println("WalkSensor started"); }
-   delay(500);
+      Serial.println("WalkSensor started");
+      delay(500); }
 
    delay(DEBOUNCE_DELAY); // wait for button push debounce
    while (digitalRead(POWERDOWN_SW) == LOW) ;  // wait for the power button to be released
    delay(DEBOUNCE_DELAY);
+   starttime_millis = millis(); // record start time
 
    #if USE_INTERRUPT
    PCICR  = 0x01; // enable pin-change interrupts
@@ -260,7 +276,7 @@ void setup() {
    falling_pulses = 0;
 
    #if BLUETOOTH
-   // We reset the Bluetooth module even if we're a transmitter, so that it doesn't broadcast our beacon name
+   // We reset the Bluetooth module even if we're a transmitter, so that it doesn't broadcast our previous beacon name
    if (!ble.begin(VERBOSE_MODE)) fatal_error(ERR_1);
    if (!ble.factoryReset()) fatal_error(ERR_2);
    #endif
@@ -284,14 +300,14 @@ void setup() {
       #endif
    }
    else { // transmitter
-      PCICR  = 0x00; // disable enable pin-change interrupts
+      PCICR  = 0x00; // disable pin-change interrupts
    }
 
    if (DEBUG) {
       Serial.print("initialization is done; we are the ");
       Serial.println(receiver ? "receiver" : "transmitter"); }
 
-   if (0) { // flash the battery voltage to verify calibration without USB power
+   if (0) { // test code flash the battery voltage, to verify calibration without USB power
       uint16_t v = read_battery_voltage();
       digitalWrite(LED_RED, HIGH);
       delay(1000);
@@ -310,29 +326,61 @@ void setup() {
 
 } //end setup()
 
-void shutdown(int flashlights) {
+void do_delay(int wait_msec) {
+   if (wait_msec > 0) {
+      #if USE_SLEEP // this code has issues...
+      // we can't use the watchdog timer b/c minimum sleep time in 15 msec
+      int interrupt_count = 0;
+      unsigned long delay_start = millis(); // time now
+      do { // HIBERNATE!
+         PRR0 = 0b10001000 ; // power down TWI and Timer/Counter 1
+         PRR1 = DEBUG ? 0b00011001 : 0b10011001 ; // power down Timer/Counters 3 and 4, USART1, and if not DEBUG, USB
+         ADCSRA &= 0x7f;   // turn off A-to-D converter
+         ACSR |= 0x80;     // turn off analog comparator
+         SMCR = 0b00000001 ; // sleep mode control: idle (need timer0 running!)
+         asm("sleep\n");
+         SMCR = 0;
+         ++interrupt_count; }
+      while (millis() - delay_start < wait_msec);
+      if (0) {
+         Serial.print(interrupt_count);
+         Serial.println(" interrupts"); }
+
+      #else // not USE_SLEEP
+      PRR1 = DEBUG ? 0b00011001 : 0b10011001 ; // power down Timer/Counters 3 and 4, USART1, and if not DEBUG, USB
+      ADCSRA &= 0x7f;   // turn off A-to-D converter
+      ACSR |= 0x80;     // turn off analog comparator
+      delay(wait_msec);
+      #endif
+   } }
+
+void shutdown(int flashcount) {
    if (DEBUG) Serial.println("shutdown!");
-   for (int i = 0; i < flashlights; ++i) {
-      digitalWrite(LED_RED, HIGH);
-      delay(500);
-      digitalWrite(LED_RED, LOW);
-      delay(500); }
+   flashlights(500, flashcount); // 500 msec flashes
    digitalWrite(POWERUP_FET, LOW);  // turn off our power
    while (1) ; // wait for oblivion
 }
 
-void beam_break(void) {
-   if (DEBUG) Serial.println("beam broken");
-   if (chk_ble_connection()) {
-      ble.println("AT+BLEUARTTX=beambreak ");
-      bool ok = ble.waitForOK();
-      if (DEBUG) {
-         Serial.print("sent message, status=");
-         Serial.println(ok); } }
+void send_msg(const char *msg) { // send a bluetooth message several times
+   static int msg_number = 0;
+   char buffer[40];
+   if (DEBUG) Serial.println(msg);
+   if (chk_ble_connection()) {  // we are connected
+      unsigned long starttime = millis();
+      ++msg_number;
+      for (int cnt = 1; cnt <= MSG_DUPS; ++cnt) {
+         ble.print("AT+BLEUARTTX=");
+         sprintf(buffer, "%s,%d,%lu. ", msg, msg_number, millis() - starttime);
+         ble.println(buffer);
+         bool ok = ble.waitForOK();
+         if (DEBUG) {
+            Serial.print("sent message, status=");
+            Serial.println(ok); }
+         do_delay(MSG_DELAY); } }
    else if (DEBUG) Serial.println("not connected"); }
 
-void update_led(struct led_status *p) {
-   if (p->cycle_count == 0)
+void update_led(struct led_status *p, bool light) {
+   if (p->cycle_count == 0 && light)
       digitalWrite(p->led, HIGH);
    if (p->cycle_count == p->on_time)
       digitalWrite(p->led, LOW);
@@ -340,45 +388,31 @@ void update_led(struct led_status *p) {
       p->cycle_count = 0; }
 
 
-
 void loop() {
-
    static uint16_t voltage; // the battery voltage we last read
    static bool beam_broken = false; // if receiver, was the beam recently interrupted?
+   static bool beam_lost_msg_sent = false;
+   static unsigned long beam_lost_time; // when we first noticed the beam was lost
 
-   #if USE_SLEEP
-   int interrupt_count = 0;
-   unsigned long delay_start = millis(); // time now
-   do {                  // HIBERNATE!
-      PRR0 = 0b10001000 ; // power down TWI and Timer/Counter 1
-      PRR1 = 0b00011000 ; // power down Timer/Counters 3 and 4
-      SMCR = 0b00000001 ; // sleep mode control: idle
-      asm("sleep\n");
-      SMCR = 0;
-      ++interrupt_count; }
-   while (millis() - delay_start < MINOR_CYCLE);
-   if (0) {
-      Serial.print(interrupt_count);
-      Serial.println(" interrupts"); }
-   #else
-   delay(MINOR_CYCLE);
-   #endif
+   //**** delay for a minor cycle time
 
+   do_delay(MINOR_CYCLE);
    #if !USE_INTERRUPT
    simulate_interrupt();   // hack if we can't get interrupts to work
    #endif
-
 do_checks:
 
    //**** check for auto-powerdown
 
-   if (millis() > (unsigned long)POWERDOWN_HOURS * 60 * 60 * 1000) {
+   if (millis() - starttime_millis > (unsigned long)POWERDOWN_MINUTES * 60 * 1000) {
       if (DEBUG) Serial.println("Auto power down");
       shutdown(3); }
 
-   //*** check battery voltage every so often
+   //*** check the battery voltage every so often
 
    if (battery_time == 0) {
+      ADCSRA |= 0x80;   // turn on A-to-D converter
+      ACSR &= 0x7f;     // turn on analog comparator
       voltage = read_battery_voltage();
       if (STOP_IF_BATTERY_LOW && voltage < BATTERY_FAIL) {  // battery failing?
          if (DEBUG) Serial.println("battery failure");
@@ -386,18 +420,18 @@ do_checks:
    if ((battery_time += MINOR_CYCLE) > BATTERY_CHK_PERIOD)
       battery_time = 0;
 
-   //**** check for status light changes
+   //**** check for status light changes due
 
    if (led_battery.cycle_count == 0) {
       led_battery.led = (voltage < BATTERY_WEAK) ? LED_RED : LED_GREEN;
       if (DEBUG) {
          Serial.print("battery_led = "); Serial.print(led_battery.led);
          Serial.print(" voltage="); Serial.println(voltage); } }
-   update_led (&led_battery);
-   if (!receiver)
-      update_led(&led_transmitting);
+   update_led (&led_battery, voltage < BATTERY_WEAK);
+   if (receiver) update_led(&led_receiving, !beam_broken);
+   else update_led(&led_transmitting, true);
 
-   //**** check for powerdown pushbutton
+   //**** check the powerdown pushbutton
 
    if (digitalRead(POWERDOWN_SW) == LOW) {
       if (DEBUG) Serial.println("power switch pushed");
@@ -407,14 +441,26 @@ do_checks:
 
    if (receiver) {
       if (beam_broken) {
-         if (falling_pulses > 1000 / IR_XMT_PERIOD) { // if we've seen at least 1 second of beam
+         if (falling_pulses > RCV_RECOVER_TIME / IR_XMT_PERIOD) { // if we've seen at least a second or so of beam
             digitalWrite(LED_BLUE, LOW);
             if (DEBUG) {
                Serial.print("resuming after pulses: ");
                Serial.println(falling_pulses); }
-            beam_broken = false;  // restart looking for a break
+            beam_lost_msg_sent = beam_broken = false;  // restart looking for a break
             ir_time = 0;
-            falling_pulses = 0; } }
+            falling_pulses = 0; }
+         else if (millis() - beam_lost_time > BEAMLOST_SECONDS * 1000) { // we never recovered the beam
+            if (!beam_lost_msg_sent) {
+               send_msg("beamlost ");
+               for (int i = 0; i < 3; ++i) {  // flash blue and yellow lights
+                  digitalWrite(LED_YELLOW, HIGH);
+                  digitalWrite(LED_BLUE, HIGH);
+                  delay(250);
+                  digitalWrite(LED_YELLOW, LOW);
+                  digitalWrite(LED_BLUE, LOW);
+                  delay(250); } }
+            beam_lost_msg_sent = true;
+            digitalWrite(LED_BLUE, LOW); } }
       else { // beam wasn't recently interrupted
          ir_time += MINOR_CYCLE;
          if (ir_time >= IR_RCV_PERIOD) { // end of sampling period
@@ -423,13 +469,14 @@ do_checks:
                Serial.println(falling_pulses); }
             if (falling_pulses <= IR_RCV_PERIOD / IR_XMT_PERIOD - MISSING_PULSE_THRESHOLD) { // if we missed at least 2 or so pulses
                digitalWrite(LED_BLUE, HIGH);
-               beam_break();        // the beam must have been broken
-               beam_broken = true; }
+               send_msg("beambreak ");        // the beam must have been broken
+               beam_broken = true;
+               beam_lost_time = starttime_millis = millis(); } // record "last activity" and "beam lost" times
             ir_time = 0;
             falling_pulses = 0;    // restart sample period
          } } }
    else { // transmitter
-      if (ir_time == 0) { // output a 38Khz burst from the IR transmitter
+      if (ir_time == 0) { // time to output a 38Khz burst from the IR transmitter
          PRR1 &= ~PRTIM1;        // make sure Timer/Counter1 is powered up
          TCCR1B = 0;             // but turned off
          TCCR1A = 0;
@@ -438,16 +485,15 @@ do_checks:
          OCR1A = F_CPU / IR_FREQ / 2 - 1;  // the compare limit is twice the frequency
          TCCR1A = 0b01000000;    // toggle OC1A on match, CTC mode
          TCCR1B = 0b00001001;    // CTC mode, no prescaling, clk/1, GO!
-         delay(IR_ON);
+         do_delay(IR_ON);
          TCCR1B = 0;             // turn off the timer
          TCCR1A = 0;
          digitalWrite(IR_TRANSMIT, HIGH); // leave with the transmitter disabled
-         delay(MINOR_CYCLE - IR_ON);  // delay for the rest of a cycle to get back in sync
-         if (IR_XMT_PERIOD > MINOR_CYCLE) ir_time = MINOR_CYCLE;
+         do_delay(MINOR_CYCLE - IR_ON);  // delay for the rest of a cycle to get back in sync
+         if (IR_XMT_PERIOD > MINOR_CYCLE) ir_time = MINOR_CYCLE; // account for one cycle out of 2 or more; else leave at 0 to do again
          goto do_checks; }
       ir_time += MINOR_CYCLE;
       if (ir_time >= IR_XMT_PERIOD)
-         ir_time = 0; }
+         ir_time = 0; } }
+//*
 
-
-}
