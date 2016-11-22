@@ -1,5 +1,6 @@
 
-    Battery-powered walk path sensor
+           Battery-powered walk path sensor
+ for clinical trials of therapies for movement disorders
 
   This is a small (4" x 4" 1.6") battery-powered wireless sensor that,
   when used in a pair on opposite sides of a walking path, detects someone
